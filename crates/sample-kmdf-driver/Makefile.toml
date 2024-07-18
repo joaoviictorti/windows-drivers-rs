@@ -1,0 +1,4 @@
+extend = [
+  { path = "../wdk-build/rust-driver-makefile.toml" },
+  { path = "../wdk-build/rust-driver-sample-makefile.toml" },
+]

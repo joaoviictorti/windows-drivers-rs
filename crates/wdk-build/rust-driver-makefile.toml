@@ -1,0 +1,454 @@
+# This file can be leveraged to build downstream drivers. See examples at https://github.com/microsoft/Windows-rust-drivers-samples
+
+# FIXME: this flow is based on the signing process of a KMDF PNP driver. There should be different flows available for different types of drivers as outlined in https://learn.microsoft.com/en-us/windows-hardware/drivers/install/test-signing-driver-packages 
+[config]
+min_version = "0.37.8"
+init_task = "wdk-build-init"
+reduce_output = false
+
+[env]
+# This allows all workspace members to access this makefile
+CARGO_MAKE_EXTEND_WORKSPACE_MAKEFILE = true
+
+# CARGO_MAKE_CARGO_BUILD_TEST_FLAGS is set to "--all-features" by default in cargo-make: https://github.com/sagiegurari/cargo-make/blob/c0abc4d0ae1bcc03adde22b63fa0accc4af2b3bc/src/lib/descriptor/makefiles/stable.toml#L31
+# This is set to "" here to match the default behavior of Cargo. 
+CARGO_MAKE_CARGO_BUILD_TEST_FLAGS = { unset = true }
+
+[plugins.impl.rust-env-update]
+script = '''
+assert ${task.has_script} "script is required for rust-env-update plugin"
+assert_eq ${task.script_runner} @rust "script_runner must be set to @rust for rust-env-update plugin"
+
+cargo_make_rust_script_provider = get_env CARGO_MAKE_RUST_SCRIPT_PROVIDER
+assert_eq ${cargo_make_rust_script_provider} rust-script "rust-env-update plugin is only compatible with rust-script"
+
+taskjson = json_parse ${task.as_json}
+
+# Install dependency crate
+out = exec --fail-on-error cargo install ${taskjson.install_crate.crate_name} --version ${taskjson.install_crate.min_version}
+assert_eq ${out.code} 0 "[tasks.${task.name}]'s install_crate failed with exit code: ${out.code}\nstdout:\n${out.stdout}\nstderr:\n${out.stderr}"
+
+# Execute rust-script
+taskjson = json_parse ${task.as_json}
+filepath = set "${CARGO_MAKE_CRATE_CUSTOM_TRIPLE_TARGET_DIRECTORY}/cargo-make-script/${task.name}/main.rs"
+# If a file already exists, only overwrite it if the script has changed (so that rust-script caching can be leveraged)
+if is_file ${filepath}
+    old_hash = digest --algo sha256 --file ${filepath}
+    new_hash = digest --algo sha256 ${taskjson.script}
+    if not eq ${old_hash} ${new_hash}
+        writefile ${filepath} ${taskjson.script}
+    end
+else
+    writefile ${filepath} ${taskjson.script}
+end
+cli_args = array_join ${flow.cli.args} " "
+# rust-script will try to consume --help, so help must be passed via TRIGGER_HELP env var in order to provide clap help output
+trigger_help = get_env TRIGGER_HELP
+if not is_empty ${trigger_help}
+    cli_args = concat ${cli_args} " --help"
+end
+out = exec --fail-on-error rust-script --base-path ${taskjson.env.CARGO_MAKE_CURRENT_TASK_INITIAL_MAKEFILE_DIRECTORY} ${CARGO_MAKE_CRATE_CUSTOM_TRIPLE_TARGET_DIRECTORY}/cargo-make-script/${task.name}/main.rs %{cli_args}
+assert_eq ${out.code} 0 "[tasks.${task.name}]'s script failed with exit code: ${out.code}\nstdout:\n${out.stdout}\nstderr:\n${out.stderr}\nThe temporary rust-script file is located at ${CARGO_MAKE_CRATE_CUSTOM_TRIPLE_TARGET_DIRECTORY}/cargo-make-script/${task.name}/main.rs"
+
+# Set cargo-make env vars based on output of rust-script
+script_output = trim ${out.stdout}
+if not is_empty ${script_output}
+    script_output_array = split ${script_output} \n
+    stdout_first_line = array_get ${script_output_array} 0
+    assert_eq ${stdout_first_line} "FORWARDING ARGS TO CARGO-MAKE:" "[tasks.${task.name}]'s script output did not begin with \"FORWARDING ARGS TO CARGO-MAKE:\". Was `--help` passed as one of the arguments?\nstdout:\n${out.stdout}\nstderr:\n${out.stderr}\nThe temporary rust-script file is located at ${CARGO_MAKE_CRATE_CUSTOM_TRIPLE_TARGET_DIRECTORY}/cargo-make-script/${task.name}/main.rs"
+    array_remove ${script_output_array} 0
+    for line in ${script_output_array}
+        parts = split ${line} =
+        key = array_get ${parts} 0
+        value = array_get ${parts} 1
+        set_env ${key} ${value}
+    end
+end
+'''
+
+[tasks.wdk-build-init]
+private = true
+install_crate = { crate_name = "rust-script", min_version = "0.30.0" }
+plugin = "rust-env-update"
+script_runner = "@rust"
+script = '''
+//! ```cargo
+//! [dependencies]
+//! wdk-build = { path = ".", version = "0.2.0" }
+//! ```
+#![allow(unused_doc_comments)]
+
+wdk_build::cargo_make::validate_and_forward_args();
+wdk_build::cargo_make::setup_path()?;
+wdk_build::cargo_make::setup_wdk_version()?;
+'''
+
+[tasks.copy-inx-to-output]
+private = true
+script_runner = "@rust"
+script_runner_args = [
+  "--base-path",
+  "${CARGO_MAKE_CURRENT_TASK_INITIAL_MAKEFILE_DIRECTORY}",
+]
+script = '''
+//! ```cargo
+//! [dependencies]
+//! wdk-build = { path = ".", version = "0.2.0" }
+//! ```
+#![allow(unused_doc_comments)]
+
+// Create build output directory if it doesn't exist
+let output_folder_path = wdk_build::cargo_make::get_wdk_build_output_directory();
+if !output_folder_path.exists() {
+    std::fs::create_dir_all(&output_folder_path).expect(&format!("creation of '{}' folder should succeed", output_folder_path.display()));
+}
+
+let cargo_make_working_directory = std::env::var("CARGO_MAKE_WORKING_DIRECTORY").expect(
+    "CARGO_MAKE_WORKING_DIRECTORY should be set by cargo-make via the env section of \
+        rust-driver-makefile.toml",
+);
+
+let source_file = [
+    cargo_make_working_directory,
+    format!("{}.inx", wdk_build::cargo_make::get_current_package_name()),
+]
+.iter()
+.collect::<std::path::PathBuf>();
+
+let destination_file = wdk_build::cargo_make::get_wdk_build_output_directory().join(format!(
+    "{}.inf",
+    wdk_build::cargo_make::get_current_package_name()
+));
+
+std::fs::copy(&source_file, &destination_file).expect(&format!(
+    "copy of '{}' file to '{}' file should succeed",
+    source_file.display(),
+    destination_file.display()
+));
+'''
+
+[tasks.generate-sys-file]
+private = true
+dependencies = ["build"]
+script_runner = "@rust"
+script_runner_args = [
+  "--base-path",
+  "${CARGO_MAKE_CURRENT_TASK_INITIAL_MAKEFILE_DIRECTORY}",
+]
+script = '''
+//! ```cargo
+//! [dependencies]
+//! wdk-build = { path = ".", version = "0.2.0" }
+//! ```
+#![allow(unused_doc_comments)]
+
+let source_file = wdk_build::cargo_make::get_wdk_build_output_directory().join(format!(
+    "{}.dll",
+    wdk_build::cargo_make::get_current_package_name()
+));
+
+let destination_file = wdk_build::cargo_make::get_wdk_build_output_directory().join(format!(
+    "{}.sys",
+    wdk_build::cargo_make::get_current_package_name()
+));
+
+std::fs::copy(&source_file, &destination_file).expect(&format!(
+    "copy of '{}' file to '{}' file should succeed",
+    source_file.display(),
+    destination_file.display()
+));
+'''
+
+[tasks.stampinf]
+private = true
+dependencies = ["copy-inx-to-output"]
+command = "stampinf"
+args = [
+  "-f",
+  "${WDK_BUILD_OUTPUT_DIRECTORY}/${CARGO_MAKE_CRATE_FS_NAME}.inf",
+  "-d",
+  "*",
+  "-a",
+  "amd64",
+  "-c",
+  "${CARGO_MAKE_CRATE_FS_NAME}.cat",
+  "-v",
+  "*",
+  "-k",
+  "1.33",
+]
+
+[tasks.infverif]
+private = true
+dependencies = ["stampinf"]
+command = "infverif"
+args = [
+  "/v",
+  "/w",
+  "@@split(WDK_BUILD_ADDITIONAL_INFVERIF_FLAGS, )",
+  "${WDK_BUILD_OUTPUT_DIRECTORY}/${CARGO_MAKE_CRATE_FS_NAME}.inf",
+]
+
+[tasks.copy-sys-to-package]
+private = true
+dependencies = ["generate-sys-file"]
+script_runner = "@rust"
+script_runner_args = [
+  "--base-path",
+  "${CARGO_MAKE_CURRENT_TASK_INITIAL_MAKEFILE_DIRECTORY}",
+]
+script = '''
+//! ```cargo
+//! [dependencies]
+//! wdk-build = { path = ".", version = "0.2.0" }
+//! ```
+#![allow(unused_doc_comments)]
+
+wdk_build::cargo_make::copy_to_driver_package_folder(
+    wdk_build::cargo_make::get_wdk_build_output_directory().join(format!(
+        "{}.sys",
+        wdk_build::cargo_make::get_current_package_name()
+    )),
+)?
+'''
+
+[tasks.copy-pdb-to-package]
+private = true
+dependencies = ["build"]
+script_runner = "@rust"
+script_runner_args = [
+  "--base-path",
+  "${CARGO_MAKE_CURRENT_TASK_INITIAL_MAKEFILE_DIRECTORY}",
+]
+script = '''
+//! ```cargo
+//! [dependencies]
+//! wdk-build = { path = ".", version = "0.2.0" }
+//! ```
+#![allow(unused_doc_comments)]
+
+wdk_build::cargo_make::copy_to_driver_package_folder(
+    wdk_build::cargo_make::get_wdk_build_output_directory().join(format!(
+        "{}.pdb",
+        wdk_build::cargo_make::get_current_package_name()
+    )),
+)?
+'''
+
+[tasks.copy-inf-to-package]
+private = true
+dependencies = ["stampinf"]
+script_runner = "@rust"
+script_runner_args = [
+  "--base-path",
+  "${CARGO_MAKE_CURRENT_TASK_INITIAL_MAKEFILE_DIRECTORY}",
+]
+script = '''
+//! ```cargo
+//! [dependencies]
+//! wdk-build = { path = ".", version = "0.2.0" }
+//! ```
+#![allow(unused_doc_comments)]
+
+wdk_build::cargo_make::copy_to_driver_package_folder(
+    wdk_build::cargo_make::get_wdk_build_output_directory().join(format!(
+        "{}.inf",
+        wdk_build::cargo_make::get_current_package_name()
+    )),
+)?
+'''
+
+[tasks.copy-map-to-package]
+private = true
+dependencies = ["build"]
+script_runner = "@rust"
+script_runner_args = [
+  "--base-path",
+  "${CARGO_MAKE_CURRENT_TASK_INITIAL_MAKEFILE_DIRECTORY}",
+]
+script = '''
+//! ```cargo
+//! [dependencies]
+//! wdk-build = { path = ".", version = "0.2.0" }
+//! ```
+#![allow(unused_doc_comments)]
+
+wdk_build::cargo_make::copy_to_driver_package_folder(
+    wdk_build::cargo_make::get_wdk_build_output_directory().join(format!(
+        "deps/{}.map",
+        wdk_build::cargo_make::get_current_package_name()
+    )),
+)?
+'''
+
+[tasks.inf2cat]
+private = true
+dependencies = ["copy-sys-to-package", "copy-inf-to-package"]
+command = "inf2cat"
+args = [
+  "/driver:${WDK_BUILD_OUTPUT_DIRECTORY}/${CARGO_MAKE_CRATE_FS_NAME}_package",
+  "/os:10_NI_X64,10_VB_X64",                                                   # TODO: this should be a parameter
+  "/uselocaltime",
+]
+
+[tasks.generate-certificate]
+private = true
+condition_script = '''
+#!@duckscript
+
+out = exec certmgr.exe -put -s WDRTestCertStore -c -n WDRLocalTestCert ${WDK_BUILD_OUTPUT_DIRECTORY}/WDRLocalTestCert.cer
+if eq ${out.code} 0
+    echo WDRLocalTestCert found in WDRTestCertStore. Skipping certificate generation.
+    exit 1
+else
+    echo WDRLocalTestCert not found in WDRTestCertStore. Generating new certificate.
+    exit 0
+end
+'''
+command = "makecert"
+args = [
+  "-r",
+  "-pe",
+  "-a",
+  "SHA256",
+  "-eku",
+  "1.3.6.1.5.5.7.3.3",
+  "-ss",
+  "WDRTestCertStore",                                   # TODO: this should be a parameter
+  "-n",
+  "CN=WDRLocalTestCert",                                # TODO: this should be a parameter
+  "${WDK_BUILD_OUTPUT_DIRECTORY}/WDRLocalTestCert.cer",
+]
+
+[tasks.copy-certificate-to-package]
+private = true
+dependencies = ["generate-certificate"]
+script_runner = "@rust"
+script_runner_args = [
+  "--base-path",
+  "${CARGO_MAKE_CURRENT_TASK_INITIAL_MAKEFILE_DIRECTORY}",
+]
+script = '''
+//! ```cargo
+//! [dependencies]
+//! wdk-build = { path = ".", version = "0.2.0" }
+//! ```
+#![allow(unused_doc_comments)]
+
+wdk_build::cargo_make::copy_to_driver_package_folder(
+    wdk_build::cargo_make::get_wdk_build_output_directory().join("WDRLocalTestCert.cer"),
+)?
+'''
+
+[tasks.signtool-sign]
+private = true
+dependencies = ["generate-certificate"]
+command = "signtool"
+args = [
+  "sign",
+  "/v",
+  "/s",
+  "WDRTestCertStore",                      # TODO: this should be a parameter
+  "/n",
+  "WDRLocalTestCert",                      # TODO: this should be a parameter
+  "/t",
+  "http://timestamp.digicert.com",
+  "/fd",
+  "SHA256",
+  "${WDK_BUILD_SIGNTOOL_SIGN_INPUT_FILE}",
+]
+
+[tasks.sign-sys]
+private = true
+dependencies = ["copy-sys-to-package"]
+env = { "WDK_BUILD_SIGNTOOL_SIGN_INPUT_FILE" = "${WDK_BUILD_OUTPUT_DIRECTORY}/${CARGO_MAKE_CRATE_FS_NAME}_package/${CARGO_MAKE_CRATE_FS_NAME}.sys" }
+run_task = "signtool-sign"
+
+[tasks.sign-cat]
+private = true
+dependencies = ["inf2cat", "sign-sys"]
+env = { "WDK_BUILD_SIGNTOOL_SIGN_INPUT_FILE" = "${WDK_BUILD_OUTPUT_DIRECTORY}/${CARGO_MAKE_CRATE_FS_NAME}_package/${CARGO_MAKE_CRATE_FS_NAME}.cat" }
+run_task = "signtool-sign"
+
+[tasks.signtool-verify]
+private = true
+condition = { env_true = ["WDK_BUILD_ENABLE_SIGNTOOL_VERIFY"] }
+command = "signtool"
+args = ["verify", "/v", "/pa", "${WDK_BUILD_SIGNTOOL_VERIFY_INPUT_FILE}"]
+
+[tasks.verify-signature-sys]
+private = true
+dependencies = ["sign-sys"]
+env = { "WDK_BUILD_SIGNTOOL_VERIFY_INPUT_FILE" = "${WDK_BUILD_OUTPUT_DIRECTORY}/${CARGO_MAKE_CRATE_FS_NAME}_package/${CARGO_MAKE_CRATE_FS_NAME}.sys" }
+run_task = "signtool-verify"
+
+[tasks.verify-signature-cat]
+private = true
+dependencies = ["sign-cat"]
+env = { "WDK_BUILD_SIGNTOOL_VERIFY_INPUT_FILE" = "${WDK_BUILD_OUTPUT_DIRECTORY}/${CARGO_MAKE_CRATE_FS_NAME}_package/${CARGO_MAKE_CRATE_FS_NAME}.cat" }
+run_task = "signtool-verify"
+
+[tasks.package-driver]
+private = true
+dependencies = [
+  "copy-sys-to-package",
+  "copy-pdb-to-package",
+  "copy-inf-to-package",
+  "copy-map-to-package",
+  "copy-certificate-to-package",
+  "sign-sys",
+  "verify-signature-sys",
+  "sign-cat",
+  "verify-signature-cat",
+  "infverif",
+]
+
+[tasks.package-driver-flow]
+# Only run flow if the current package is marked as a driver
+condition_script = '''
+#!@duckscript
+
+# Execute Cargo Metadata to get Package information
+out = exec --fail-on-error cargo metadata --no-deps --format-version 1 --manifest-path ${CARGO_MAKE_WORKING_DIRECTORY}/Cargo.toml
+assert_eq ${out.code} 0 "cargo metadata failed with exit code: ${out.code}\nstdout:\n${out.stdout}\nstderr:\n${out.stderr}"
+
+manifest_metadata = json_parse --collection ${out.stdout}
+packages = map_get ${manifest_metadata} packages
+contains_wdk_metadata = set false
+
+for package in ${packages}
+    package_name = map_get ${package} name
+    
+    # Find metadata for the current package
+    if eq ${package_name} ${CARGO_MAKE_CRATE_NAME}
+        package_metadata = map_get ${package} metadata
+
+        # Check if the package contains a metadata section
+        if is_map ${package_metadata}
+
+            # Check if the package contains a package.metadata.wdk section
+            contains_wdk_metadata = map_contains_key ${package_metadata} wdk
+        end
+    end
+end
+
+release --recursive ${manifest_metadata}
+
+# Run driver package-driver task if the package contains a package.metadata.wdk section
+if ${contains_wdk_metadata}
+    echo Building and packaging driver: ${CARGO_MAKE_CRATE_NAME}...
+    exit 0
+else
+    echo ${CARGO_MAKE_CRATE_NAME} does not contain a package.metadata.wdk section in its manifest. Skipping package-driver task.
+    exit 1
+end
+'''
+run_task = "package-driver"
+
+[tasks.help]
+workspace = false
+env = { "TRIGGER_HELP" = "1" }
+run_task = "wdk-build-init"
+
+[tasks.default]
+alias = "package-driver-flow"

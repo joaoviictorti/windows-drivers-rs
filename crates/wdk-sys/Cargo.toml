@@ -1,0 +1,69 @@
+[package]
+edition.workspace = true
+name = "wdk-sys"
+version = "0.2.0"
+# Since the WDK links against many different dlls (that vary based off configuration), this crate sets the system library name to be "wdk". This name is only used by downstream build.rs scripts to consume metadata
+links = "wdk"
+description = "Direct bindings to APIs available in the Windows Development Kit (WDK)"
+repository.workspace = true
+readme.workspace = true
+license.workspace = true
+keywords = ["wdk", "windows", "wdf", "wdm", "ffi"]
+categories = [
+  "external-ffi-bindings",
+  "development-tools::ffi",
+  "os::windows-apis",
+  "os",
+]
+
+[build-dependencies]
+bindgen.workspace = true
+wdk-build.workspace = true
+thiserror = "1.0.59"
+tracing-subscriber = { version = "0.3.18", features = ["env-filter"] }
+anyhow = "1.0.82"
+
+[dependencies]
+wdk-macros.workspace = true
+lazy_static = { version = "1.4.0", features = ["spin_no_std"] }
+rustversion = "1.0.15"
+
+[features]
+default = []
+nightly = ["wdk-macros/nightly"]
+test-stubs = []
+
+# Cannot inherit workspace lints since overriding them is not supported yet: https://github.com/rust-lang/cargo/issues/13157
+# [lints]
+# workspace = true
+# 
+# Differences from the workspace lints have comments explaining why they are different
+
+[lints.rust]
+missing_docs = "warn"
+# unsafe_op_in_unsafe_fn = "forbid"
+unsafe_op_in_unsafe_fn = "deny" # This is lowered to deny so that we can opt out of it for generated code
+
+[lints.clippy]
+# Lint Groups
+all = "deny"
+pedantic = "warn"
+nursery = "warn"
+cargo = "warn"
+# Individual Lints
+# multiple_unsafe_ops_per_block = "forbid"
+multiple_unsafe_ops_per_block = "deny" # This is lowered to deny so that we can opt out of it for generated code
+# undocumented_unsafe_blocks = "forbid"
+undocumented_unsafe_blocks = "deny" # This is lowered to deny so that we can opt out of it for generated code
+unnecessary_safety_doc = "forbid"
+
+[lints.rustdoc]
+bare_urls = "warn"
+broken_intra_doc_links = "warn"
+invalid_codeblock_attributes = "warn"
+invalid_html_tags = "warn"
+invalid_rust_codeblocks = "warn"
+missing_crate_level_docs = "warn"
+private_intra_doc_links = "warn"
+redundant_explicit_links = "warn"
+unescaped_backticks = "warn"
